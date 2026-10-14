@@ -98,23 +98,70 @@ echo "== 3/5 docker グループ =="
 usermod -aG docker "$RUNNER_USER"
 echo "  $RUNNER_USER の所属: $(id -nG "$RUNNER_USER")"
 
-echo "== 4/5 systemd サービス化 =="
+echo "== 4/5 PATH 設定と systemd サービス化 =="
+# ジョブの shell は非ログイン・最小環境で起動するため、fish の fnm 初期化も
+# shell/paths.sh も読まれず node / npx が見えない（exit 127）。
+# runner の .env に PATH を書けばジョブへ引き継がれる。fnm の aliases/default は
+# node の更新に追従するシンボリックリンクなので、バージョンを固定せずに済む。
+# PATH= 行は置き換えるだけで、何度実行しても重複しない。
+env_file="$RUNNER_DIR/.env"
+runner_path="$home/.local/share/fnm/aliases/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+path_changed=0
+if [ ! -e "$env_file" ]; then
+	install -m 644 -o "$RUNNER_USER" /dev/null "$env_file"
+fi
+if grep -qxF "PATH=$runner_path" "$env_file"; then
+	echo "  $env_file の PATH は設定済み"
+else
+	sed -i '/^PATH=/d' "$env_file"
+	# 末尾が改行で終わっていないと直前の行に連結されてしまう。
+	if [ -s "$env_file" ] && [ -n "$(tail -c1 "$env_file")" ]; then
+		echo >>"$env_file"
+	fi
+	echo "PATH=$runner_path" >>"$env_file"
+	path_changed=1
+	echo "  $env_file に PATH を設定した"
+fi
+
 cd "$RUNNER_DIR"
 if [ -f .service ]; then
 	echo "  既にサービス化済み: $(cat .service)"
 else
 	./svc.sh install "$RUNNER_USER"
 fi
+unit=$(cat .service)
+# .env は runner の起動時にだけ読まれる。稼働中だった場合は再起動が必要だが、
+# 実行中のジョブ（Runner.Worker）を落とさないよう、ジョブが無いときだけ行う。
+was_active=0
+systemctl is-active --quiet "$unit" && was_active=1
 ./svc.sh start
+if [ "$path_changed" -eq 1 ] && [ "$was_active" -eq 1 ]; then
+	if pgrep -u "$RUNNER_USER" -f Runner.Worker >/dev/null; then
+		echo "  ジョブ実行中のため runner を再起動していません。PATH を反映するには" >&2
+		echo "  ジョブが無くなってから sudo systemctl restart $unit を実行してください" >&2
+	else
+		systemctl restart "$unit"
+		echo "  PATH 反映のため runner を再起動した"
+	fi
+fi
 
 echo "== 5/5 確認 =="
 docker --version
 docker buildx version
 gcc --version | head -1
+echo "--- ジョブ shell（非ログイン・最小環境）から node / npx ---"
+# ジョブ shell 相当の環境で、.env の PATH だけを頼りに node / npx が引けるかを見る。
+if ! sudo -u "$RUNNER_USER" -H env -i HOME="$home" PATH="$(grep '^PATH=' "$env_file" | cut -d= -f2-)" bash --noprofile --norc -c 'command -v node npx'; then
+	echo "  NG: node / npx が見えません（fnm で node を入れ、fnm default を設定してください）" >&2
+fi
+echo "--- コンテナ内の名前解決 ---"
+# docker build 中の DNS 障害は、デプロイが長時間待ってから落ちて初めて気づくため
+# セットアップ時点で検知する。自動修正はしない（/etc/docker/daemon.json の "dns" はホスト固有）。
+docker run --rm alpine nslookup proxy.golang.org >/dev/null 2>&1 \
+	|| echo "  NG: コンテナから名前解決できません (docker の dns 設定を確認: README の GitHub Actions self-hosted runner 節)" >&2
 echo "--- NOPASSWD sudo ---"
 sudo -l -U "$RUNNER_USER" | grep -i nopasswd || echo "  NOPASSWD が見つかりません" >&2
 echo "--- runner サービス ---"
-unit=$(cat "$RUNNER_DIR/.service")
 systemctl is-enabled "$unit" || true
 systemctl is-active "$unit" || true
 echo "--- runner のグループ反映（稼働プロセス）---"
