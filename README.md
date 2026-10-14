@@ -41,8 +41,10 @@ sudo RUNNER_USER=ci-runner RUNNER_DIR=/opt/runners/foo bash runner-host-setup.sh
 | 1 | `/etc/sudoers.d/github-runner` に `<user> ALL=(ALL) NOPASSWD: ALL`（0440） | `ariga/setup-atlas` が `sudo install` で `/usr/local/bin` へ atlas を置くため |
 | 2 | `docker.io` + `docker-buildx` + `build-essential`、`systemctl enable --now docker` | `docker.io` 単体では buildx が入らない。`gcc` がないと `go test -race` が落ちる |
 | 3 | `usermod -aG docker <user>` | ないと docker ソケットに繋げない |
-| 4 | `svc.sh install <user>` → `svc.sh start` | systemd サービスとして常駐させる |
+| 4 | runner の `.env` に `PATH=<home>/.local/share/fnm/aliases/default/bin:...` → `svc.sh install <user>` → `svc.sh start` | ジョブ shell は非ログイン・最小環境で、fnm の `node` / `npx` が PATH に出ないため。`aliases/default` は node の更新に追従する |
 | 5 | 上記すべての確認 | 下記「確認していること」を参照 |
+
+`.env` は runner の起動時にしか読まれない。稼働中の runner で PATH を変えた場合は、ジョブ（`Runner.Worker`）が走っていなければ再起動し、走っていれば再起動を促すメッセージだけを出す。`PATH=` 行は置き換えるので重複しない。
 
 **3 → 4 の順序が重要。** `usermod` は既存プロセスに反映されないため、グループに入れてから runner を起動する。この順序なら runner の再起動は不要になる。すでにサービスが動いている状態で実行した場合は `svc.sh start` では足りないので、5 の検査が `NG` を出して `systemctl restart` を促す。
 
@@ -59,6 +61,8 @@ sudo RUNNER_USER=ci-runner RUNNER_DIR=/opt/runners/foo bash runner-host-setup.sh
 | C コンパイラ | `gcc --version` |
 | パスワード不要 sudo | `sudo -l -U <user>` の `NOPASSWD` |
 | runner サービス | `systemctl is-enabled` / `is-active` |
+| ジョブ shell から `node` / `npx` | `env -i` + `bash --noprofile --norc` で、`.env` の PATH だけを頼りに `command -v node npx` |
+| コンテナ内の名前解決 | `docker run --rm alpine nslookup proxy.golang.org`。NG は自動修正せず、`/etc/docker/daemon.json` の `"dns"`（ホスト固有）を確認する |
 | docker グループの**稼働プロセスへの反映** | `/proc/<pid>/status` の `Groups` に docker の gid が入っているか |
 
 最後の 1 つが重要で、「グループには追加済みなのに `permission denied` が出続ける」という一番はまりやすい状態を切り分ける。`id -nG <user>` は新しいセッションの値を返すため、**稼働中の `Runner.Listener` に反映されているかは分からない**。
@@ -72,6 +76,8 @@ sudo RUNNER_USER=ci-runner RUNNER_DIR=/opt/runners/foo bash runner-host-setup.sh
 | Docker | `docker: command not found` |
 | Buildx | `the --chmod option requires BuildKit`（`COPY --chmod` を含む Dockerfile のビルド時） |
 | docker グループ | `permission denied while trying to connect to the Docker daemon socket` |
+| `.env` の PATH（fnm） | `node: コマンドが見つかりません`（exit 127） |
+| コンテナの DNS | `docker build` 中の `lookup ... on <DNS>:53: i/o timeout` |
 | C コンパイラ（`gcc`） | `-race requires cgo; enable cgo by setting CGO_ENABLED=1` |
 
 ## スクリプトからは検証できないこと
