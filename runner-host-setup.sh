@@ -192,7 +192,13 @@ systemctl is-active "$unit" || ng "$unit が active ではありません"
 echo "--- runner のグループ反映（稼働プロセス）---"
 # gsr-helper の doctor（job.dockergroup）と同じ判定。「グループ追加済みなのに
 # permission denied が出続ける」= 稼働プロセスへの未反映を切り分けるため。
-pid=$(pgrep -u "$RUNNER_USER" -f Runner.Listener | head -1 || true)
+# svc.sh start / systemctl restart の直後は Listener の起動までに間があるため、上限付きで待つ。
+pid=
+for _ in $(seq 1 30); do
+	pid=$(pgrep -u "$RUNNER_USER" -f Runner.Listener | head -1 || true)
+	[ -n "$pid" ] && break
+	sleep 1
+done
 if [ -n "$pid" ]; then
 	docker_gid=$(getent group docker | cut -d: -f3)
 	# Groups 行だけを見る。status 全体を grep すると Pid や Uid の数値に当たる。
@@ -206,7 +212,7 @@ if [ -n "$pid" ]; then
 		;;
 	esac
 else
-	ng "Runner.Listener が見つかりません（起動直後なら数秒待って systemctl status $unit を確認）"
+	ng "Runner.Listener が 30 秒待っても見つかりません（systemctl status $unit を確認）"
 fi
 
 echo
