@@ -2,7 +2,7 @@
 
 GitHub Actions の self-hosted runner ホストをセットアップするスクリプト。
 
-ジョブ実行の前提（パスワード不要 sudo / Docker / Buildx / docker グループ / C コンパイラ）を整え、登録済みの runner を systemd サービスとして起動する。2 台目以降のホストはこれを実行すれば済む。
+ジョブ実行の前提（パスワード不要 sudo / Docker / Buildx / docker グループ / C コンパイラ）と、ジョブ shell から `node` / `npx` を引くための PATH（runner の `.env`）を整え、登録済みの runner を systemd サービスとして起動する。最後にコンテナ内の名前解決を含む状態を確認する。2 台目以降のホストはこれを実行すれば済む。
 
 対象は **Linux + systemd、apt 系ディストリビューション**（Ubuntu 24.04 で実測）。
 
@@ -32,7 +32,7 @@ runner のユーザーとディレクトリは環境変数で変えられる。
 sudo RUNNER_USER=ci-runner RUNNER_DIR=/opt/runners/foo bash runner-host-setup.sh
 ```
 
-失敗したらその場で止まる（`set -e`）。何度実行しても同じ結果になる。
+失敗したらその場で止まる（`set -e`）。何度実行しても同じ結果になる。設定が済んでも「確認していること」で NG が 1 件でもあれば、最後に終了コード 1 で終わる（自動化から呼んでも欠落を検知できる）。
 
 ## やること
 
@@ -52,6 +52,8 @@ sudo RUNNER_USER=ci-runner RUNNER_DIR=/opt/runners/foo bash runner-host-setup.sh
 
 一時ファイルに書いて `visudo -c -f` で検証し、**合格したものだけを `install` する**。`tee` で置いてから `visudo -c` する順序だと、壊れた内容が `/etc/sudoers.d/` に一瞬でも入り、その時点で `sudo` 自体が使えなくなってその端末からの復旧手段を失う。設置後にも `visudo -c` で全体を再検証する。
 
+設置先は固定名の 1 ファイル（`/etc/sudoers.d/github-runner`）。**同じホストで別の `RUNNER_USER` を指定して再実行すると、前のユーザーの行は置き換わる。** 複数ユーザーで runner を動かす場合は、設置後に必要な行を手で足す。
+
 ## 確認していること
 
 | 項目 | 判定方法 |
@@ -61,8 +63,8 @@ sudo RUNNER_USER=ci-runner RUNNER_DIR=/opt/runners/foo bash runner-host-setup.sh
 | C コンパイラ | `gcc --version` |
 | パスワード不要 sudo | `sudo -l -U <user>` の `NOPASSWD` |
 | runner サービス | `systemctl is-enabled` / `is-active` |
-| ジョブ shell から `node` / `npx` | `env -i` + `bash --noprofile --norc` で、`.env` の PATH だけを頼りに `command -v node npx` |
-| コンテナ内の名前解決 | `docker run --rm alpine nslookup proxy.golang.org`。NG は自動修正せず、`/etc/docker/daemon.json` の `"dns"`（ホスト固有）を確認する |
+| ジョブ shell から `node` / `npx` | `env -i` + `bash --noprofile --norc` で、`.env` の PATH だけを頼りに `command -v` を `node` と `npx` それぞれに実行する（`command -v` は複数の名前を渡すと 1 つでも見つかれば成功するため 1 つずつ検査する） |
+| コンテナ内の名前解決 | `docker run --rm alpine nslookup proxy.golang.org`。NG は自動修正せず、`/etc/docker/daemon.json` の `"dns"`（ホスト固有）を確認する。`alpine` イメージを用意できない場合（Docker Hub への到達性・レート制限・daemon 不調）は DNS とは別の NG として報告する |
 | docker グループの**稼働プロセスへの反映** | `/proc/<pid>/status` の `Groups` に docker の gid が入っているか |
 
 最後の 1 つが重要で、「グループには追加済みなのに `permission denied` が出続ける」という一番はまりやすい状態を切り分ける。`id -nG <user>` は新しいセッションの値を返すため、**稼働中の `Runner.Listener` に反映されているかは分からない**。
@@ -107,7 +109,7 @@ org の Settings → Actions → Runner groups で確認する。
 
 ## 関連
 
-runner の増減・稼働確認・障害切り分け・ディスク掃除は [gsr-helper](https://github.com/ousiassllc/gsr-helper)（TUI）で行う。このスクリプトが整える 4 項目（sudo / docker / buildx / docker グループ）は gsr-helper の doctor がジョブ実行の前提として検査する項目と対応している。
+runner の増減・稼働確認・障害切り分け・ディスク掃除は [gsr-helper](https://github.com/ousiassllc/gsr-helper)（TUI）で行う。このスクリプトが整える項目のうち 4 つ（sudo / docker / buildx / docker グループ）は gsr-helper の doctor がジョブ実行の前提として検査する項目と対応している。
 
 ```sh
 sudo gsr-helper -root ~/actions-runner

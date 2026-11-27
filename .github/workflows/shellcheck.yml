@@ -1,0 +1,21 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    # このリポジトリは public。NOPASSWD sudo を持つ self-hosted runner を public の
+    # workflow に使ってはならない（README 参照）ので GitHub ホストの runner を使う。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: bash -n runner-host-setup.sh
+      - name: shellcheck
+        run: shellcheck -x runner-host-setup.sh

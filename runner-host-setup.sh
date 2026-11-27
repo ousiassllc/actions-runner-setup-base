@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # GitHub Actions self-hosted runner ホストのセットアップ（Linux + systemd / apt 系）
 #
-# ジョブ実行の前提（パスワード不要 sudo / Docker / Buildx / docker グループ / C コンパイラ）を
-# 整え、登録済み runner を systemd サービスとして起動する。
+# ジョブ実行の前提（パスワード不要 sudo / Docker / Buildx / docker グループ / C コンパイラ）と、
+# ジョブ shell から node / npx を引くための PATH（runner の .env）を整え、登録済み runner を
+# systemd サービスとして起動する。最後にコンテナ内の名前解決を含む状態確認を行う。
 #
 # 前提: config.sh による runner の登録が済んでいること（.runner が存在すること）。
 #       未登録の場合は先に ./config.sh --url ... --token ... を実行する。
@@ -16,10 +17,18 @@
 #   RUNNER_DIR   $RUNNER_USER のホームディレクトリ配下の actions-runner
 #
 # 失敗したらその場で止まる（set -e）。何度実行しても同じ結果になる。
+# 設定が済んでも 5/5 の確認で NG が 1 件でもあれば、最後に終了コード 1 で終わる。
 
 set -euo pipefail
 
 SUDOERS_FILE=/etc/sudoers.d/github-runner
+
+# 5/5 の確認で NG を数える。set -e では止めず、全項目を見せてから最後に終了コードへ反映する。
+ng_count=0
+ng() {
+	echo "  NG: $*" >&2
+	ng_count=$((ng_count + 1))
+}
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "root で実行してください: sudo bash $0" >&2
@@ -47,6 +56,9 @@ if [ ! -x "$RUNNER_DIR/svc.sh" ]; then
 	exit 1
 fi
 
+# 相対パスで渡されても、4/5 の cd 後に $RUNNER_DIR/.env を引けるよう絶対パスにしておく。
+RUNNER_DIR=$(cd -P -- "$RUNNER_DIR" && pwd)
+
 # .runner は config.sh が作る。未登録のまま svc.sh install しても起動できない。
 if [ ! -f "$RUNNER_DIR/.runner" ]; then
 	echo "runner が未登録です（$RUNNER_DIR/.runner がありません）。" >&2
@@ -66,15 +78,19 @@ echo "== 1/5 パスワード不要 sudo =="
 #
 # 注意: NOPASSWD: ALL は、この runner で走る任意のワークフローに実質 root を与える。
 # runner group の対象リポジトリを限定し、public リポジトリへ提供しないことが前提。
-if [ -f "$SUDOERS_FILE" ] && grep -qE "^${RUNNER_USER}[[:space:]]+ALL=\(ALL\)[[:space:]]+NOPASSWD:[[:space:]]*ALL$" "$SUDOERS_FILE"; then
+#
+# 設置先は固定名の 1 ファイル。別の RUNNER_USER で再実行すると前のユーザーの行は置き換わる。
+sudoers_line="$RUNNER_USER ALL=(ALL) NOPASSWD: ALL"
+if [ -f "$SUDOERS_FILE" ] && grep -qxF "$sudoers_line" "$SUDOERS_FILE"; then
 	echo "  既に設定済み: $SUDOERS_FILE"
 else
 	tmp=$(mktemp)
-	printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$RUNNER_USER" >"$tmp"
+	# visudo -c -f が失敗して set -e で終わるときも一時ファイルを残さない。
+	trap 'rm -f "$tmp"' EXIT
+	printf '%s\n' "$sudoers_line" >"$tmp"
 	chmod 0440 "$tmp"
 	visudo -c -f "$tmp"
 	install -m 0440 -o root -g root "$tmp" "$SUDOERS_FILE"
-	rm -f "$tmp"
 	visudo -c
 	echo "  設置: $SUDOERS_FILE"
 fi
@@ -151,35 +167,52 @@ docker buildx version
 gcc --version | head -1
 echo "--- ジョブ shell（非ログイン・最小環境）から node / npx ---"
 # ジョブ shell 相当の環境で、.env の PATH だけを頼りに node / npx が引けるかを見る。
-if ! sudo -u "$RUNNER_USER" -H env -i HOME="$home" PATH="$(grep '^PATH=' "$env_file" | cut -d= -f2-)" bash --noprofile --norc -c 'command -v node npx'; then
-	echo "  NG: node / npx が見えません（fnm で node を入れ、fnm default を設定してください）" >&2
-fi
+# command -v は複数の名前を渡すと 1 つでも見つかれば成功を返すため、1 つずつ検査する。
+job_path=$(grep '^PATH=' "$env_file" | cut -d= -f2-)
+for cmd in node npx; do
+	if ! sudo -u "$RUNNER_USER" -H env -i HOME="$home" PATH="$job_path" bash --noprofile --norc -c 'command -v "$1"' _ "$cmd"; then
+		ng "$cmd が見えません（fnm で node を入れ、fnm default を設定してください）"
+	fi
+done
 echo "--- コンテナ内の名前解決 ---"
 # docker build 中の DNS 障害は、デプロイが長時間待ってから落ちて初めて気づくため
 # セットアップ時点で検知する。自動修正はしない（/etc/docker/daemon.json の "dns" はホスト固有）。
-docker run --rm alpine nslookup proxy.golang.org >/dev/null 2>&1 \
-	|| echo "  NG: コンテナから名前解決できません (docker の dns 設定を確認: README の GitHub Actions self-hosted runner 節)" >&2
+# イメージを用意できない場合（Docker Hub への到達性・レート制限・daemon 不調）は DNS の
+# 不具合と取り違えないよう、別の NG として扱う。
+if ! docker image inspect alpine >/dev/null 2>&1 && ! docker pull -q alpine >/dev/null 2>&1; then
+	ng "alpine イメージを用意できません（docker daemon の状態と Docker Hub への到達性を確認してください。DNS は未検査）"
+elif ! docker run --rm alpine nslookup proxy.golang.org >/dev/null 2>&1; then
+	ng "コンテナから名前解決できません（docker の dns 設定を確認: README「欠けているものと症状」の「コンテナの DNS」）"
+fi
 echo "--- NOPASSWD sudo ---"
-sudo -l -U "$RUNNER_USER" | grep -i nopasswd || echo "  NOPASSWD が見つかりません" >&2
+sudo -l -U "$RUNNER_USER" | grep -i nopasswd || ng "NOPASSWD が見つかりません"
 echo "--- runner サービス ---"
-systemctl is-enabled "$unit" || true
-systemctl is-active "$unit" || true
+systemctl is-enabled "$unit" || ng "$unit が enable されていません"
+systemctl is-active "$unit" || ng "$unit が active ではありません"
 echo "--- runner のグループ反映（稼働プロセス）---"
 # gsr-helper の doctor（job.dockergroup）と同じ判定。「グループ追加済みなのに
 # permission denied が出続ける」= 稼働プロセスへの未反映を切り分けるため。
-pid=$(pgrep -u "$RUNNER_USER" -f Runner.Listener | head -1 || true)
+# svc.sh start / systemctl restart の直後は Listener の起動までに間があるため、上限付きで待つ。
+pid=
+for _ in $(seq 1 30); do
+	pid=$(pgrep -u "$RUNNER_USER" -f Runner.Listener | head -1 || true)
+	[ -n "$pid" ] && break
+	sleep 1
+done
 if [ -n "$pid" ]; then
 	docker_gid=$(getent group docker | cut -d: -f3)
 	# Groups 行だけを見る。status 全体を grep すると Pid や Uid の数値に当たる。
 	groups_line=$(awk '/^Groups:/{$1=""; print}' "/proc/$pid/status")
-	if printf ' %s ' $groups_line | grep -q " ${docker_gid} "; then
+	case " $groups_line " in
+	*" $docker_gid "*)
 		echo "  OK: Runner.Listener (pid $pid) は docker グループを持っている"
-	else
-		echo "  NG: Runner.Listener (pid $pid) に docker グループが反映されていない" >&2
-		echo "      sudo systemctl restart $unit を実行してください" >&2
-	fi
+		;;
+	*)
+		ng "Runner.Listener (pid $pid) に docker グループが反映されていない（sudo systemctl restart $unit を実行してください）"
+		;;
+	esac
 else
-	echo "  Runner.Listener が見つかりません（起動直後なら数秒待って systemctl status $unit を確認）" >&2
+	ng "Runner.Listener が 30 秒待っても見つかりません（systemctl status $unit を確認）"
 fi
 
 echo
@@ -199,3 +232,9 @@ cat <<EOS
     NOPASSWD: ALL を入れた以上、ここが fork PR 経由で第三者のコードが
     この runner 上で走ることを防ぐ唯一の層になる。
 EOS
+
+if [ "$ng_count" -gt 0 ]; then
+	echo >&2
+	echo "確認で NG が ${ng_count} 件ありました。上の NG を解消してから再実行してください。" >&2
+	exit 1
+fi
